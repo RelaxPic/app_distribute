@@ -1,0 +1,13 @@
+POST http://localhost:8089/v1/app/1.0.3/1243 HTTP/1.1
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="file.csv"
+
+// The 'input.txt' file will be uploaded
+< /home/song/sproject/app_distribute/app-release.apk
+--boundary
+Content-Disposition: form-data; name="file"
+
+1
+--boundary
