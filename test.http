@@ -1,6 +1,6 @@
 GET http://localhost:8089/v1/app/preview
 Accept: application/json
-
+Authorization: Basic YWRtaW46YWRtaW4xOTk1
 ###
 
 
@@ -12,23 +12,17 @@ Accept: application/json
 
 GET http://localhost:8089/v1/app/1.0.3
 
+###
+PUT http://localhost:8089/v1/app/download/1.0.3
 
 ###
-PUT http://localhost:8089/v1/app/1.0.3/release
-
 
 ###
 POST http://localhost:8089/v1/app/1.0.4-rc01/1244 HTTP/1.1
+Authorization: Basic YWRtaW46YWRtaW4xOTk1
 Content-Type: multipart/form-data; boundary=boundary
-
 --boundary
 Content-Disposition: form-data; name="file"; filename="file.apk"
-
-// The 'input.txt' file will be uploaded
 < /home/song/project/app_distribute/lzc-client-android-1.0.6-alpha5.apk
---boundary
-Content-Disposition: form-data; name="file"
-
-1
 --boundary
 
