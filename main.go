@@ -7,8 +7,7 @@ import (
 	"fmt"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"github.com/philippgille/gokv/bbolt"
-	"github.com/philippgille/gokv/encoding"
+	"github.com/philippgille/gokv/file"
 	"io"
 	"io/fs"
 	"net/http"
@@ -23,33 +22,50 @@ import (
 const apps = "apps"
 
 type AppInfo struct {
-	VersionName string `json:"version_name"`
-	VersionCode int    `json:"version_code"`
+	VersionName string `json:"versionName"`
+	VersionCode int    `json:"versionCode"`
 	Release     bool   `json:"release"`
 	Timestamp   int64  `json:"timestamp"`
-	Latest      bool   `json:"Latest"`
+	Latest      bool   `json:"latest"`
+}
+
+type ExternalAppInfo struct {
+	VersionName  string `json:"versionName"`
+	VersionCode  int    `json:"versionCode"`
+	Release      bool   `json:"release"`
+	Latest       bool   `json:"latest"`
+	DownloadLink string `json:"downloadLink"`
 }
 
 //go:embed ui/dist
 var ui embed.FS
 var dbPath = ""
 var filePath = ""
+var domain = ""
 
 func main() {
 	port := flag.Int("port", 8089, "port")
-	var filePaths = flag.String("upload_path", "/home/song/app/", "文件目录")
-	var dbPathS = flag.String("db_path", "/home/song/db/", "数据库目录")
+	var filePaths = flag.String("upload_path", "~/app/", "文件目录")
+	var dbPathS = flag.String("db_path", "~/db/", "数据库目录")
+	var domainS = flag.String("app_domain", "https://test.com", "域名")
+	var usernameS = flag.String("usernameS", "admin", "账号")
+	var passwordS = flag.String("passwordS", "admin1995", "密码")
 	flag.Parse()
 
 	dbPath = *dbPathS
 	filePath = *filePaths
+	domain = *domainS
 	en := gin.Default()
+	auth := gin.BasicAuth(gin.Accounts{
+		*usernameS: *passwordS,
+	})
+	en.MaxMultipartMemory = 1024 * 1024 * 40
 	en.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, "pong")
 	})
 	en.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"PUT", "PATCH", "GET"},
+		AllowMethods:     []string{"PUT", "PATCH", "GET", "POST"},
 		AllowHeaders:     []string{"Origin"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
@@ -58,86 +74,92 @@ func main() {
 	v1 := en.Group("/v1/app")
 	{
 		// 查询正式版本和预览版本最大的版本号
-		v1.GET("/official", func(context *gin.Context) {
+		v1.GET("/release", auth, func(context *gin.Context) {
 			findApp(context, true)
 		})
-		v1.GET("/preview", func(context *gin.Context) {
+		v1.GET("/preview", auth, func(context *gin.Context) {
 			findApp(context, false)
 		})
-		// 下载正式版本和预览版本 最新的版本
-		v1.GET("/:versionName", func(context *gin.Context) {
-			handlerDownload(context)
+		// 下载正式版本和预览版本最新的版本
+		v1.GET("/download/:versionName", func(context *gin.Context) {
+			handlerDownload(context, false)
 		})
+		// 下载最新正式版
+		v1.GET("/download-release", func(context *gin.Context) {
+			handlerDownload(context, true)
+		})
+
 		// 设置正式版和与预览版最新的版本号码
-		v1.PUT("/:versionName/official", func(context *gin.Context) {
+		v1.PATCH("/:versionName/release", auth, func(context *gin.Context) {
 			setLatest(context, true)
 		})
-		v1.PUT("/:versionName/preview", func(context *gin.Context) {
+		v1.PATCH("/:versionName/preview", auth, func(context *gin.Context) {
 			setLatest(context, false)
 		})
 		// 上传apk
-		v1.POST("/:versionName/:versionCode", func(c *gin.Context) {
-			file, err := c.FormFile("file")
-			if err != nil {
-				c.JSON(http.StatusBadRequest, err.Error())
-				return
-			}
-			open, err := file.Open()
-			if err != nil {
-				c.JSON(http.StatusBadRequest, err.Error())
-				return
-			}
-			versionName := c.Param("versionName")
-			versionCode := c.Param("versionCode")
-
-			// 创建目标文件
-			destFile := filepath.Join(filePath, filepath.Base(versionName+".apk"))
-			dest, err := os.Create(destFile)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, err.Error())
-				return
-			}
-			defer dest.Close()
-			// 复制文件内容
-			_, err = io.Copy(dest, open)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, err.Error())
-				return
-			}
-			store, err := createStore()
-			if err != nil {
-				fmt.Println("创建数据库失败" + err.Error())
-				c.JSON(http.StatusInternalServerError, err.Error())
-				return
-			}
-			defer store.Close()
-			infos := []AppInfo{}
-			_, err = store.Get("apps", &infos)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, err.Error())
-				return
-			}
-			versionC, err := strconv.Atoi(versionCode)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, err.Error())
-				return
-			}
-			isRelease := !ContainsLetter(versionName)
-			// 可能存在
-			var find = false
-			for i := range infos {
-				if infos[i].VersionName == versionName {
-					infos[i].VersionCode = versionC
-					find = true
-					break
+		v1.POST("/:versionName/:versionCode", auth,
+			func(c *gin.Context) {
+				file, err := c.FormFile("file")
+				if err != nil {
+					c.JSON(http.StatusBadRequest, err.Error())
+					return
 				}
-			}
-			if !find {
-				infos = append(infos, AppInfo{VersionName: versionName, VersionCode: versionC, Release: isRelease, Timestamp: time.Now().Unix()})
-			}
-			store.Set("apps", infos)
-			c.JSON(http.StatusOK, "ok")
-		})
+				open, err := file.Open()
+				if err != nil {
+					c.JSON(http.StatusBadRequest, err.Error())
+					return
+				}
+				versionName := c.Param("versionName")
+				versionCode := c.Param("versionCode")
+
+				// 创建目标文件
+				destFile := filepath.Join(filePath, filepath.Base(versionName+".apk"))
+				dest, err := os.Create(destFile)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, err.Error())
+					return
+				}
+				defer dest.Close()
+				// 复制文件内容
+				_, err = io.Copy(dest, open)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, err.Error())
+					return
+				}
+				store, err := createStore()
+				if err != nil {
+					fmt.Println("创建数据库失败" + err.Error())
+					c.JSON(http.StatusInternalServerError, err.Error())
+					return
+				}
+				defer store.Close()
+				infos := []AppInfo{}
+				_, err = store.Get("apps", &infos)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, err.Error())
+					return
+				}
+				versionC, err := strconv.Atoi(versionCode)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, err.Error())
+					return
+				}
+				isRelease := !ContainsLetter(versionName)
+				// 可能存在
+				var find = false
+				for i := range infos {
+					if infos[i].VersionName == versionName {
+						infos[i].VersionCode = versionC
+						find = true
+						break
+					}
+				}
+				if !find {
+					infos = append(infos, AppInfo{VersionName: versionName, VersionCode: versionC, Release: isRelease, Timestamp: time.Now().Unix()})
+				}
+				store.Set("apps", infos)
+				c.JSON(http.StatusCreated, "ok")
+			})
 	}
 
 	err := en.Run(fmt.Sprintf(":%d", *port))
@@ -159,17 +181,17 @@ func ContainsLetter(s string) bool {
 func setLatest(context *gin.Context, release bool) {
 	store, err := createStore()
 	if err != nil {
-		context.JSON(http.StatusInternalServerError, err.Error())
+		resoJSONError(context, err)
 		return
 	}
 	infos := []AppInfo{}
 	found, err := store.Get(apps, &infos)
 	if err != nil {
-		context.JSON(http.StatusInternalServerError, err.Error())
+		resoJSONError(context, err)
 		return
 	}
 	if !found {
-		context.JSON(http.StatusNotFound, "not found")
+		context.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 	var find = false
@@ -183,17 +205,21 @@ func setLatest(context *gin.Context, release bool) {
 	}
 	if find {
 		store.Set(apps, infos)
-		context.JSON(http.StatusOK, "ok")
+		context.JSON(http.StatusCreated, gin.H{})
 	} else {
-		context.JSON(http.StatusNotFound, "not found")
+		context.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 	}
+}
+
+func resoJSONError(context *gin.Context, err error) {
+	context.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 }
 
 func findApp(context *gin.Context, release bool) {
 	store, err := createStore()
 	if err != nil {
 		fmt.Println("创建数据库失败" + err.Error())
-		context.JSON(http.StatusInternalServerError, err.Error())
+		context.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer store.Close()
@@ -201,29 +227,81 @@ func findApp(context *gin.Context, release bool) {
 	found, err := store.Get("apps", &infos)
 	if err != nil {
 		fmt.Println("查询数据库失败" + err.Error())
-		context.JSON(http.StatusInternalServerError, err.Error())
+		context.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if !found {
-		context.JSON(http.StatusNotFound, "not found")
+		context.JSON(http.StatusNotFound, gin.H{"error": "找不到应用apk"})
 		return
 	}
 	var info = AppInfo{VersionCode: 0}
+	var exist = false
 	for i := range infos {
 		if infos[i].Release == release {
 			if infos[i].Latest {
 				info = infos[i]
+				exist = true
+				break
 			}
 		}
 	}
-	context.JSON(http.StatusOK, info)
+	if exist {
+		var extAppInfo = ExternalAppInfo{
+			VersionName:  info.VersionName,
+			VersionCode:  info.VersionCode,
+			Release:      info.Release,
+			Latest:       info.Latest,
+			DownloadLink: domain + info.VersionName + ".apk",
+		}
+		context.JSON(http.StatusOK, extAppInfo)
+	} else {
+		context.JSON(http.StatusNotFound, gin.H{})
+	}
 }
-func handlerDownload(c *gin.Context) {
-	param := c.Param("versionName")
-	filePath := "/path/to/file/"
-	fileName := filePath + param + ".apk"
+func handlerDownload(c *gin.Context, relase bool) {
+	var downloadFilePath = ""
+	var fileName = ""
+	if relase {
+		store, err := createStore()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		infos := []AppInfo{}
+		found, err := store.Get("apps", &infos)
+		if err != nil {
+			fmt.Println("查询数据库失败" + err.Error())
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if !found {
+			c.JSON(http.StatusNotFound, gin.H{"error": "找不到应用apk"})
+			return
+		}
+		var info = AppInfo{VersionCode: 0}
+		var exist = false
+		for i := range infos {
+			if infos[i].Release && infos[i].Latest {
+				if infos[i].Latest {
+					info = infos[i]
+					exist = true
+					break
+				}
+			}
+		}
+		if !exist {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "not found"})
+			return
+		}
+		fileName = info.VersionName + ".apk"
+		downloadFilePath = filePath + fileName
+	} else {
+		param := c.Param("versionName")
+		fileName = param + ".apk"
+		downloadFilePath = filePath + fileName
+	}
 
-	file, err := os.Open(fileName)
+	file, err := os.Open(downloadFilePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -269,10 +347,9 @@ func handlerDownload(c *gin.Context) {
 			return
 		}
 	}
-
-	// 如果没有范围请求，发送完整文件
 	c.Header("Content-Type", "application/vnd.android.package-archive")
-	c.File(fileName)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", "慢图浏览_"+fileName))
+	c.File(filePath)
 }
 
 // 解析范围请求头
@@ -332,21 +409,19 @@ func createUIHanlder() http.Handler {
 	return fileServer
 }
 
-func createStore() (*bbolt.Store, error) {
-	path := dbPath + "app.db"
-	_, err2 := os.Stat(path)
+func createStore() (*file.Store, error) {
+	_, err2 := os.Stat(dbPath)
 	if err2 != nil && os.IsNotExist(err2) {
-		file, err3 := os.Create(path)
+		file, err3 := os.Create(dbPath)
 		if err3 != nil {
 			return nil, err3
 		}
 		defer file.Close()
 	}
-	options := bbolt.Options{
-		Path:  path,
-		Codec: encoding.JSON,
+	options := file.Options{
+		Directory: dbPath,
 	}
-	store, err := bbolt.NewStore(options)
+	store, err := file.NewStore(options)
 	if err != nil {
 		return nil, err
 	}
